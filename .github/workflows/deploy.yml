@@ -1,0 +1,91 @@
+name: Build and deploy AI Test Generator
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SAM_STACK_NAME: ${{ vars.SAM_STACK_NAME }}
+      ECR_REPOSITORY_NAME: ai-test-generator-sandbox
+      VPC_ID: ${{ vars.VPC_ID }}
+      VPC_CIDR: ${{ vars.VPC_CIDR }}
+      PRIVATE_SUBNET_IDS: ${{ vars.PRIVATE_SUBNET_IDS }}
+      PRIVATE_ROUTE_TABLE_IDS: ${{ vars.PRIVATE_ROUTE_TABLE_IDS }}
+      S3_PREFIX_LIST_ID: ${{ vars.S3_PREFIX_LIST_ID }}
+      LLM_SECRET_ARN: ${{ secrets.LLM_SECRET_ARN }}
+      API_KEY_SECRET_ARN: ${{ secrets.API_KEY_SECRET_ARN }}
+      GITHUB_SECRET_ARN: ${{ secrets.GITHUB_SECRET_ARN }}
+      REGRESSION_REPO: ${{ vars.REGRESSION_REPO }}
+      REGRESSION_BRANCH: ${{ vars.REGRESSION_BRANCH }}
+      REGRESSION_MODULES_JSON: ${{ vars.REGRESSION_MODULES_JSON }}
+      LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+      OLLAMA_BASE_URL: ${{ vars.OLLAMA_BASE_URL }}
+      CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push Fargate sandbox image
+        id: sandbox
+        run: |
+          output=$(./deploy/build_sandbox_image.sh)
+          echo "$output"
+          image_uri=$(printf '%s\n' "$output" | sed -n 's/^SandboxImageUri=//p' | tail -n 1)
+          test -n "$image_uri"
+          echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/setup-sam@v2
+      - name: Build Lambda container
+        run: sam build --template-file deploy/template.yaml
+      - name: Deploy SAM stack
+        env:
+          SANDBOX_IMAGE_URI: ${{ steps.sandbox.outputs.image_uri }}
+        run: |
+          : "${AWS_REGION:?Set repository variable AWS_REGION}"
+          : "${SAM_STACK_NAME:?Set repository variable SAM_STACK_NAME}"
+          : "${VPC_ID:?Set VPC_ID}"
+          : "${VPC_CIDR:?Set VPC_CIDR}"
+          : "${PRIVATE_SUBNET_IDS:?Set PRIVATE_SUBNET_IDS as comma-separated subnet IDs}"
+          : "${PRIVATE_ROUTE_TABLE_IDS:?Set PRIVATE_ROUTE_TABLE_IDS}"
+          : "${S3_PREFIX_LIST_ID:?Set S3_PREFIX_LIST_ID for this region}"
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 \
+            --resolve-image-repos \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "VpcId=$VPC_ID" \
+              "VpcCidr=$VPC_CIDR" \
+              "PrivateSubnetIds=$PRIVATE_SUBNET_IDS" \
+              "PrivateRouteTableIds=$PRIVATE_ROUTE_TABLE_IDS" \
+              "S3PrefixListId=$S3_PREFIX_LIST_ID" \
+              "SandboxImageUri=$SANDBOX_IMAGE_URI" \
+              "LLMSecretArn=${LLM_SECRET_ARN:-}" \
+              "ApiKeySecretArn=${API_KEY_SECRET_ARN:?Set API_KEY_SECRET_ARN}" \
+              "GitHubSecretArn=${GITHUB_SECRET_ARN:-}" \
+              "LLMProvider=${LLM_PROVIDER:-openai}" \
+              "LLMModel=${LLM_MODEL:-gpt-4o}" \
+              "OllamaBaseUrl=${OLLAMA_BASE_URL:-http://localhost:11434}" \
+              "CorsOrigins=${CORS_ORIGINS:-*}" \
+              "RegressionRepo=${REGRESSION_REPO:-}" \
+              "RegressionBranch=${REGRESSION_BRANCH:-main}" \
+              "RegressionModulesJson=${REGRESSION_MODULES_JSON:-[]}" \
+            --tags Product=AI-Test-Generator ManagedBy=GitHubActions

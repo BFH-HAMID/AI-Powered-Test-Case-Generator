@@ -1,0 +1,19 @@
+{
+  "description": "Weekly regression generation configuration used by deploy/template.yaml",
+  "schedule_expression": "cron(0 2 ? * SUN *)",
+  "timezone": "UTC",
+  "enabled_when_repo_and_modules_are_configured": true,
+  "target_input": {
+    "automation": "weekly-regression",
+    "repo": "owner/repository",
+    "branch": "main",
+    "modules": [
+      "src/calculator.py",
+      "src/validators.py"
+    ]
+  },
+  "limits": {
+    "maximum_modules_per_invocation": 5,
+    "task_timeout_seconds": 900
+  }
+}
