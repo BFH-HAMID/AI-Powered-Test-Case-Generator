@@ -1,0 +1,122 @@
+name: Run generated tests
+
+on:
+  push:
+    branches:
+      - "ai-tests/**"
+    paths:
+      - "tests/**"
+      - "**/*Test.java"
+      - "**/*.test.js"
+      - "**/*.spec.js"
+  pull_request:
+    paths:
+      - "tests/**"
+      - "**/*Test.java"
+      - "**/*.test.js"
+      - "**/*.spec.js"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: generated-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python / pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-cov
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+      - name: Run Python tests
+        id: pytest
+        run: |
+          mkdir -p reports
+          pytest -q tests \
+            --junitxml=reports/junit-python.xml \
+            --cov=. \
+            --cov-report=xml:reports/coverage-python.xml
+      - name: Upload Python JUnit and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-results
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  javascript-tests:
+    name: JavaScript / Jest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Jest dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-save jest jest-junit; fi
+          npm install --no-save jest-junit
+      - name: Run JavaScript tests
+        env:
+          JEST_JUNIT_OUTPUT: reports/junit-javascript.xml
+        run: |
+          mkdir -p reports
+          npx jest --runInBand --passWithNoTests --reporters=default --reporters=jest-junit
+      - name: Upload JavaScript reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: javascript-test-results
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  java-tests:
+    name: Java / JUnit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Run Maven tests when configured
+        run: |
+          mkdir -p reports
+          if [ -f pom.xml ]; then
+            mvn -B -ntp test
+            find . -path '*/surefire-reports/TEST-*.xml' -type f -exec cp {} reports/ \;
+          elif [ -x ./gradlew ]; then
+            ./gradlew test
+            find . -path '*/test-results/test/*.xml' -type f -exec cp {} reports/ \;
+          else
+            echo "No Maven pom.xml or Gradle wrapper; Java JUnit execution is not configured in this repository."
+          fi
+      - name: Upload Java test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-test-results
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14

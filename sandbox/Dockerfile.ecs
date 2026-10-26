@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+LABEL maintainer="AI-Powered Test Case Generator"
+LABEL description="One-shot Fargate runner using presigned S3 inputs and no task IAM role"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN python -m pip install --no-cache-dir pytest==8.3.3 pytest-cov==5.0.0 httpx==0.28.1 && \
+    groupadd --gid 10002 sandbox && \
+    useradd --uid 10002 --gid sandbox --no-create-home --shell /usr/sbin/nologin sandbox && \
+    mkdir -p /opt/sandbox && chown root:root /opt/sandbox && chmod 0555 /opt/sandbox
+
+COPY --chown=root:root sandbox/ecs_runner.py /opt/sandbox/ecs_runner.py
+RUN chmod 0444 /opt/sandbox/ecs_runner.py
+
+# The supervisor starts as root only to make input/source files root-owned and read-only,
+# then launches pytest as UID/GID 10002. The Fargate task has no TaskRoleArn and can reach only S3.
+USER 0:0
+WORKDIR /opt/sandbox
+ENTRYPOINT ["python", "/opt/sandbox/ecs_runner.py"]

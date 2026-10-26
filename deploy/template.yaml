@@ -1,0 +1,488 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  AI-Powered Test Case Generator: FastAPI on Lambda, PostgreSQL history, S3 artifacts,
+  and an isolated one-shot ECS Fargate sandbox worker.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC hosting the private Lambda, RDS, and Fargate subnets.
+  VpcCidr:
+    Type: String
+    Description: VPC IPv4 CIDR, used only for DNS egress from the Fargate runner.
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for Lambda, RDS, and Fargate; Lambda needs NAT egress and Fargate uses private VPC endpoints.
+  PrivateRouteTableIds:
+    Type: List<String>
+    Description: Private route table IDs that receive the S3 Gateway endpoint route.
+  S3PrefixListId:
+    Type: String
+    Description: Region-specific AWS-managed S3 prefix list ID (for example, pl-xxxxxxxx); restricts Fargate egress to S3.
+  LLMSecretArn:
+    Type: String
+    Default: ""
+    Description: Optional Secrets Manager secret ARN with openai_api_key and/or anthropic_api_key JSON keys.
+  ApiKeySecretArn:
+    Type: String
+    Description: Required Secrets Manager secret ARN containing a non-empty api_key JSON field for the HTTP API.
+  GitHubSecretArn:
+    Type: String
+    Default: ""
+    Description: Optional Secrets Manager secret ARN with github_token and webhook_secret JSON keys.
+  LLMProvider:
+    Type: String
+    Default: openai
+    AllowedValues: [openai, anthropic, ollama, local-synthesizer]
+  LLMModel:
+    Type: String
+    Default: gpt-4o
+  OllamaBaseUrl:
+    Type: String
+    Default: "http://localhost:11434"
+    Description: Optional Ollama-compatible API base URL reachable from the Lambda VPC.
+  SandboxImageUri:
+    Type: String
+    Description: ECR image URI built from sandbox/Dockerfile.ecs (Python pytest Fargate runner).
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t4g.medium]
+  CorsOrigins:
+    Type: String
+    Default: "*"
+    Description: UI origin (use one exact deployed Streamlit origin in production; default wildcard is for development).
+  RegressionRepo:
+    Type: String
+    Default: ""
+    Description: Optional owner/repo to cover in the weekly EventBridge regression run.
+  RegressionBranch:
+    Type: String
+    Default: main
+  RegressionModulesJson:
+    Type: String
+    Default: "[]"
+    Description: JSON array of source paths (up to five), e.g. ["src/math_utils.py"].
+  RegressionScheduleExpression:
+    Type: String
+    Default: "cron(0 2 ? * SUN *)"
+    Description: Weekly schedule in UTC; default is Sunday at 02:00 UTC.
+
+Conditions:
+  HasLlmSecret: !Not [!Equals [!Ref LLMSecretArn, ""]]
+  HasGitHubSecret: !Not [!Equals [!Ref GitHubSecretArn, ""]]
+  HasRegressionConfig: !And
+    - !Not [!Equals [!Ref RegressionRepo, ""]]
+    - !Not [!Equals [!Ref RegressionModulesJson, "[]"]]
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireGeneratedArtifacts
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Generated master password for the AI Test Generator PostgreSQL database.
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"ai_test_gen"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the generator run-history database.
+      SubnetIds: !Ref PrivateSubnetIds
+
+  ApiFunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda egress for PostgreSQL and external LLM/GitHub APIs.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound to the configured NAT and database.
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL accepts connections only from the API Lambda.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !GetAtt ApiFunctionSecurityGroup.GroupId
+          Description: SQLAlchemy connections from the API Lambda only.
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "ai-test-generator-${AWS::StackName}"
+      Engine: postgres
+      EngineVersion: "16.9"
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: ai_test_gen
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: true
+
+  SandboxS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds: !Ref PrivateRouteTableIds
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: [s3:GetObject, s3:PutObject]
+            Resource: !Sub "${ArtifactsBucket.Arn}/generated-tests/*"
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*"
+
+  SandboxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate sandbox egress is limited to S3, private VPC endpoints, and VPC DNS.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref S3PrefixListId
+          Description: HTTPS to AWS S3 regional prefix only.
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: VPC DNS resolver.
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: VPC DNS resolver TCP fallback.
+
+  SandboxVpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS ingress to ECR and CloudWatch Logs endpoints from sandbox tasks only.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !GetAtt SandboxSecurityGroup.GroupId
+      SecurityGroupEgress: []
+
+  SandboxEndpointEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt SandboxSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !GetAtt SandboxVpcEndpointSecurityGroup.GroupId
+      Description: HTTPS only to private ECR and CloudWatch Logs endpoints.
+
+  EcrApiVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !GetAtt SandboxVpcEndpointSecurityGroup.GroupId
+
+  EcrDockerVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !GetAtt SandboxVpcEndpointSecurityGroup.GroupId
+
+  CloudWatchLogsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !GetAtt SandboxVpcEndpointSecurityGroup.GroupId
+
+  SandboxCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "ai-test-generator-${AWS::StackName}"
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  SandboxLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/ai-test-generator/${AWS::StackName}"
+      RetentionInDays: 14
+
+  SandboxTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  SandboxTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "ai-test-generator-sandbox-${AWS::StackName}"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt SandboxTaskExecutionRole.Arn
+      # Deliberately no TaskRoleArn: the test container receives only short-lived, single-object
+      # presigned S3 URLs; it has no AWS IAM credentials to enumerate other runs or secrets.
+      ContainerDefinitions:
+        - Name: test-sandbox
+          Image: !Ref SandboxImageUri
+          Essential: true
+          ReadonlyRootFilesystem: false
+          Environment:
+            - Name: PYTHONUNBUFFERED
+              Value: "1"
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref SandboxLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: sandbox
+
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      EndpointConfiguration: REGIONAL
+      BinaryMediaTypes:
+        - application/pdf
+        - application/zip
+      Cors:
+        AllowOrigin: !Sub "'${CorsOrigins}'"
+        AllowHeaders: "'Content-Type,X-API-Key,X-Request-ID,X-Hub-Signature-256,X-GitHub-Event'"
+        AllowMethods: "'GET,POST,OPTIONS'"
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApiFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "ai-test-generator-${AWS::StackName}"
+      PackageType: Image
+      Timeout: 900
+      MemorySize: 2048
+      Architectures: [x86_64]
+      Tracing: Active
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt ApiFunctionSecurityGroup.GroupId
+        SubnetIds: !Ref PrivateSubnetIds
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AWSLambdaVPCAccessExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject]
+              Resource: !Sub "${ArtifactsBucket.Arn}/generated-tests/*"
+            - Effect: Allow
+              Action: [ecs:RunTask]
+              Resource: !Ref SandboxTaskDefinition
+            - Effect: Allow
+              Action: [ecs:DescribeTasks, ecs:StopTask]
+              Resource: "*"
+            - Effect: Allow
+              Action: [iam:PassRole]
+              Resource: !GetAtt SandboxTaskExecutionRole.Arn
+              Condition:
+                StringEquals:
+                  iam:PassedToService: ecs-tasks.amazonaws.com
+      Environment:
+        Variables:
+          APP_NAME: "AI-Powered Test Case Generator"
+          APP_ENV: production
+          LOG_LEVEL: INFO
+          API_HOST: 0.0.0.0
+          API_PORT: "8000"
+          CORS_ORIGINS: !Ref CorsOrigins
+          DATABASE_URL: !Sub "postgresql+psycopg2://ai_test_gen:{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}@${DatabaseInstance.Endpoint.Address}:5432/ai_test_gen"
+          API_KEY: !Sub "{{resolve:secretsmanager:${ApiKeySecretArn}:SecretString:api_key}}"
+          GITHUB_WEBHOOK_SECRET: !If [HasGitHubSecret, !Sub "{{resolve:secretsmanager:${GitHubSecretArn}:SecretString:webhook_secret}}", ""]
+          GITHUB_TOKEN: !If [HasGitHubSecret, !Sub "{{resolve:secretsmanager:${GitHubSecretArn}:SecretString:github_token}}", ""]
+          OPENAI_API_KEY: !If [HasLlmSecret, !Sub "{{resolve:secretsmanager:${LLMSecretArn}:SecretString:openai_api_key}}", ""]
+          ANTHROPIC_API_KEY: !If [HasLlmSecret, !Sub "{{resolve:secretsmanager:${LLMSecretArn}:SecretString:anthropic_api_key}}", ""]
+          LLM_PROVIDER: !Ref LLMProvider
+          LLM_MODEL: !Ref LLMModel
+          OLLAMA_BASE_URL: !Ref OllamaBaseUrl
+          LLM_TIMEOUT_SECONDS: "45"
+          SANDBOX_MODE: docker
+          SANDBOX_TIMEOUT_SECONDS: "120"
+          SANDBOX_MEMORY_LIMIT_MB: "256"
+          SANDBOX_CPU_LIMIT: "1.0"
+          ECS_CLUSTER_ARN: !GetAtt SandboxCluster.Arn
+          ECS_TASK_DEFINITION_ARN: !Ref SandboxTaskDefinition
+          ECS_SUBNETS: !Join [",", !Ref PrivateSubnetIds]
+          ECS_SECURITY_GROUP_ID: !GetAtt SandboxSecurityGroup.GroupId
+          ECS_CONTAINER_NAME: test-sandbox
+          ECS_TASK_TIMEOUT_SECONDS: "300"
+          ARTIFACT_BUCKET: !Ref ArtifactsBucket
+          ARTIFACT_PREFIX: generated-tests
+          ALLOWED_TEST_DIR: tests/generated
+          GIT_ISOLATED_WORKSPACE: /tmp/ai-test-gen-git-workspace
+          MAX_ITERATIONS_DEFAULT: "3"
+      Events:
+        ApiRoot:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /
+            Method: ANY
+        ApiProxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /{proxy+}
+            Method: ANY
+    Metadata:
+      Dockerfile: deploy/Dockerfile.lambda
+      DockerContext: ..
+      DockerTag: python3.11-v1
+
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/ai-test-generator-${AWS::StackName}"
+      RetentionInDays: 30
+
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: More than five Lambda errors in five minutes.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ApiDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda duration reached ten minutes; consider moving generation to SQS workers.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 600000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  WeeklyRegressionSchedule:
+    Type: AWS::Events::Rule
+    Condition: HasRegressionConfig
+    Properties:
+      Description: Weekly configured source-module regression test generation.
+      ScheduleExpression: !Ref RegressionScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ApiFunction.Arn
+          Id: WeeklyRegressionGenerator
+          Input: !Sub '{"automation":"weekly-regression","repo":"${RegressionRepo}","branch":"${RegressionBranch}","modules":${RegressionModulesJson}}'
+
+  AllowEventBridgeInvokeGenerator:
+    Type: AWS::Lambda::Permission
+    Condition: HasRegressionConfig
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyRegressionSchedule.Arn
+
+Outputs:
+  ApiBaseUrl:
+    Description: API Gateway base URL. Add this as BACKEND_URL to the Streamlit service.
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  ArtifactsBucketName:
+    Description: Encrypted S3 bucket for generated test bundles and Fargate handoff artifacts.
+    Value: !Ref ArtifactsBucket
+  DatabaseEndpoint:
+    Description: Private PostgreSQL endpoint used for run and iteration history.
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+  EcsSandboxClusterArn:
+    Description: ECS cluster used by the Lambda API for isolated Python dry-runs.
+    Value: !GetAtt SandboxCluster.Arn
+  EcsSandboxTaskDefinition:
+    Description: Fargate sandbox task definition.
+    Value: !Ref SandboxTaskDefinition
