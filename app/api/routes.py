@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
 import re
 import uuid
 from pathlib import Path
@@ -607,6 +608,14 @@ def commit_run(run_id: str, request: CommitRequest) -> Dict[str, Any]:
     if request.create_pr:
         raise HTTPException(
             status_code=400, detail="A GitHub repo and GITHUB_TOKEN are required to open a PR"
+        )
+    if os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Manual commits in Lambda require a GitHub repo and GITHUB_TOKEN; "
+                "configure GitHub integration to commit this run."
+            ),
         )
     try:
         saved = save_and_commit_tests(

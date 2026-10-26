@@ -192,6 +192,35 @@ class WidgetTest {
     assert response.json()["file_path"] == captured["file_path"]
 
 
+def test_lambda_manual_commit_requires_github_destination(tmp_path, monkeypatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{tmp_path / 'lambda_commit.db'}")
+    monkeypatch.setattr(settings, "github_token", "")
+    monkeypatch.setattr(settings, "api_key", "")
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "test-generator")
+    monkeypatch.setattr(
+        "app.api.routes.get_run_with_details",
+        lambda _: {
+            "run_id": "lambda-run",
+            "test_code": """class WidgetTest { void smokeTest() {} }
+""",
+            "language": "java",
+            "module_name": "Widget",
+            "source_code": """package org.example;
+class Widget {}
+""",
+            "repo_url": None,
+            "branch": "main",
+        },
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/commit/lambda-run", json={})
+
+    assert response.status_code == 400
+    assert "GITHUB_TOKEN" in response.json()["detail"]
+
+
 def test_api_key_protection(tmp_path, monkeypatch) -> None:
     settings = get_settings()
     monkeypatch.setattr(settings, "database_url", f"sqlite:///{tmp_path / 'auth_test.db'}")
